@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "f1predict"
+version = "0.1.0"
+description = "F1 race pace & pit strategy prediction using FastF1 + sklearn/xgboost + Streamlit"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

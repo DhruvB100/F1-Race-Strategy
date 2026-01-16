@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Data / models
+data/fastf1_cache/
+data/*.parquet
+models/*.joblib
+models/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/
