@@ -49,7 +49,19 @@ def main():
     y_reg = ds["lap_time_s"].astype(float)
     y_clf = ds["pit_within_k"].astype(int)
     groups = ds["race_group"]
-
+    
+    pos = y_clf.sum()
+    neg = len(y_clf) - pos
+    if pos > 0:
+        spw = float(neg / pos)
+        try:
+            clf_pipe.set_params(model__scale_pos_weight=spw)
+        except Exception:
+            pass
+        print(f"[INFO] scale_pos_weight={spw:.2f} (pos={pos}, neg={neg})")
+    else:
+        print("[WARN] No positive pit labels found. Increase pit horizon or check pit detection.")
+        
     reg_metrics = groupkfold_eval_regression(X, y_reg, groups, reg_pipe, mcfg.n_splits)
     clf_metrics = groupkfold_eval_classification(X, y_clf, groups, clf_pipe, mcfg.n_splits)
 

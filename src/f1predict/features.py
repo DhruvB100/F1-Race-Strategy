@@ -60,9 +60,19 @@ def add_features_and_labels(raw: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFra
 
     df = df.rename(columns={"LapTime_s": "lap_time_s"})
 
-    # A lap is considered a pit lap if PitInTime exists (car pitted at end of this lap).
-    pit_lap = df["PitInTime_s"].notna() if "PitInTime_s" in df.columns else pd.Series(False, index=df.index)
-    df["pit_this_lap"] = pit_lap.astype(int)
+    # pit at end of lap if the next lap starts a new stint (Stint increases on next lap)
+    df = df.sort_values(["year", "round", "event_name", "Driver", "LapNumber"]).reset_index(drop=True)
+    group_keys = ["year", "round", "event_name", "Driver"]
+
+    next_stint = df.groupby(group_keys)["Stint"].shift(-1)
+    pit_by_stint = (next_stint > df["Stint"]).fillna(False)
+
+    pit_by_in = df["PitInTime_s"].notna() if "PitInTime_s" in df.columns else False
+    pit_by_out = df["PitOutTime_s"].notna() if "PitOutTime_s" in df.columns else False
+
+    df["pit_this_lap"] = (pit_by_stint | pit_by_in | pit_by_out).astype(int)
+    
+    
 
     # Traffic gap computed from cumulative Time_s; then shift to prev lap to avoid leakage
     if "Time_s" in df.columns and "Position" in df.columns:
