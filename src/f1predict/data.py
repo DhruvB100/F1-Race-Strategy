@@ -1,176 +1,160 @@
-from __future__ import annotations
-
+import os
 import warnings
-from dataclasses import dataclass
-from typing import Optional, List, Tuple
 
 import numpy as np
 import pandas as pd
-
 import fastf1
-from fastf1.core import Session
 
-from .config import PATHS, DEFAULT_SESSION
-from .utils import ensure_dir
+from .config import DATA_DIR, CACHE_DIR
 
 
-@dataclass(frozen=True)
-class BuildConfig:
-    year: int
-    session: str = DEFAULT_SESSION  # "R" = Race
-    max_events: Optional[int] = None
-    include_sprint_events: bool = False  # keep False for simpler grouping
-
-
-def _enable_fastf1_cache() -> None:
-    ensure_dir(PATHS.cache_dir)
-    fastf1.Cache.enable_cache(str(PATHS.cache_dir))
-
-
-def _event_schedule(year: int) -> pd.DataFrame:
-    # FastF1 schedule columns include RoundNumber, EventName, EventDate, EventFormat, etc.
-    sched = fastf1.get_event_schedule(year)
-    sched = sched.copy()
-    # keep only races (exclude testing)
-    if "EventFormat" in sched.columns:
-        # EventFormat often contains "conventional", "sprint", etc.
-        pass
-    return sched
-
-
-def _load_session(year: int, round_number: int, session_name: str) -> Session:
-    session = fastf1.get_session(year, round_number, session_name)
-    # Laps + weather + track status are what we rely on.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        session.load(laps=True, telemetry=False, weather=True)
-    return session
-
-
-def _safe_timedelta_to_seconds(x) -> float:
-    if pd.isna(x):
-        return np.nan
-    try:
-        return x.total_seconds()
-    except Exception:
-        return np.nan
-
-
-def build_raw_laps(cfg: BuildConfig) -> pd.DataFrame:
+def load_season_data(year, session_type="R", max_events=None):
     """
-    Build a raw lap-level table for a season:
-    - laps (timing + tyre + sectors)
-    - merged weather (track temp etc) by nearest timestamp
-    - merged track status by nearest timestamp
+    Download and combine all race lap data for a given season using the FastF1 API.
+
+    Parameters:
+        year: season year (e.g. 2024)
+        session_type: "R" for race, "Q" for qualifying, etc.
+        max_events: if set, only load the first N events (useful for testing)
+
+    Returns:
+        A big DataFrame with one row per lap, with timing + weather + track status info
     """
-    _enable_fastf1_cache()
-    ensure_dir(PATHS.data_dir)
+    # Set up local cache so we don't re-download the same data
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fastf1.Cache.enable_cache(str(CACHE_DIR))
 
-    sched = _event_schedule(cfg.year)
+    # Get the list of races for this season
+    schedule = fastf1.get_event_schedule(year)
+    schedule = schedule.dropna(subset=["RoundNumber"])
+    schedule = schedule.sort_values("RoundNumber").reset_index(drop=True)
 
-    # choose events: RoundNumber not null and session exists
-    sched = sched.dropna(subset=["RoundNumber"])
-    sched = sched.sort_values("RoundNumber")
+    if max_events is not None:
+        schedule = schedule.head(max_events)
 
-    if cfg.max_events is not None:
-        sched = sched.head(cfg.max_events)
+    print(f"Found {len(schedule)} events for {year}")
 
-    rows: List[pd.DataFrame] = []
+    all_laps = []
 
-    for _, ev in sched.iterrows():
-        round_no = int(ev["RoundNumber"])
-        event_name = str(ev.get("EventName", f"Round {round_no}"))
+    for _, event in schedule.iterrows():
+        round_num = int(event["RoundNumber"])
+        event_name = str(event.get("EventName", f"Round {round_num}"))
 
+        print(f"Loading Round {round_num}: {event_name}...")
+
+        # Try to load session data, skip if it fails
         try:
-            session = _load_session(cfg.year, round_no, cfg.session)
+            session = fastf1.get_session(year, round_num, session_type)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                session.load(laps=True, telemetry=False, weather=True)
         except Exception as e:
-            print(f"[WARN] Skipping {cfg.year} round {round_no} ({event_name}): load failed: {e}")
+            print(f"  Could not load - skipping ({e})")
             continue
 
         laps = session.laps
         if laps is None or len(laps) == 0:
-            print(f"[WARN] No laps for {cfg.year} round {round_no} ({event_name})")
+            print(f"  No laps found, skipping")
             continue
 
         laps_df = laps.copy()
 
-        # basic columns we want to keep stable
-        keep_cols = [
+        # Only keep columns we actually need
+        cols_to_keep = [
             "Driver", "Team", "LapNumber", "Stint", "Compound", "TyreLife",
-            "FreshTyre", "LapTime", "Sector1Time", "Sector2Time", "Sector3Time",
+            "LapTime", "Sector1Time", "Sector2Time", "Sector3Time",
             "IsAccurate", "Deleted", "Position", "Time", "LapStartTime",
             "PitInTime", "PitOutTime",
         ]
-        existing = [c for c in keep_cols if c in laps_df.columns]
-        laps_df = laps_df[existing].copy()
+        cols_to_keep = [c for c in cols_to_keep if c in laps_df.columns]
+        laps_df = laps_df[cols_to_keep].copy()
 
-        laps_df["year"] = cfg.year
-        laps_df["round"] = round_no
+        # Tag each lap with which race it came from
+        laps_df["year"] = year
+        laps_df["round"] = round_num
         laps_df["event_name"] = event_name
-        laps_df["session"] = cfg.session
 
-        # Convert timedeltas to seconds for modeling
-        for col in ["LapTime", "Sector1Time", "Sector2Time", "Sector3Time", "Time", "LapStartTime", "PitInTime", "PitOutTime"]:
+        # sklearn can't work with timedelta objects, so convert to seconds
+        time_cols = ["LapTime", "Sector1Time", "Sector2Time", "Sector3Time",
+                     "Time", "LapStartTime", "PitInTime", "PitOutTime"]
+        for col in time_cols:
             if col in laps_df.columns:
-                laps_df[col + "_s"] = laps_df[col].apply(_safe_timedelta_to_seconds)
+                laps_df[col + "_s"] = laps_df[col].apply(
+                    lambda x: x.total_seconds() if pd.notna(x) else np.nan
+                )
 
-        # Weather merge (nearest)
+        # Merge in weather data (track temp, humidity, etc.)
+        # We match each lap to the closest weather reading by time
         weather = getattr(session, "weather_data", None)
         if weather is not None and len(weather) > 0 and "Time" in weather.columns:
             w = weather.copy()
-            w = w.sort_values("Time")
-            # weather Time is Timedelta since session start
-            w["Time_s"] = w["Time"].apply(_safe_timedelta_to_seconds)
-            # Merge on LapStartTime_s if available else Time_s (lap end time)
-            key = "LapStartTime_s" if "LapStartTime_s" in laps_df.columns else "Time_s"
-            if key in laps_df.columns:
-                laps_df = laps_df.sort_values(key)
+            w["Time_s"] = w["Time"].apply(
+                lambda x: x.total_seconds() if pd.notna(x) else np.nan
+            )
+            w = w.sort_values("Time_s")
+
+            # prefer lap start time for matching
+            merge_key = "LapStartTime_s" if "LapStartTime_s" in laps_df.columns else "Time_s"
+            if merge_key in laps_df.columns:
+                laps_df = laps_df.sort_values(merge_key)
+                weather_cols = [c for c in ["TrackTemp", "AirTemp", "Humidity", "Pressure", "WindSpeed", "Rainfall"]
+                                if c in w.columns]
                 laps_df = pd.merge_asof(
                     laps_df,
-                    w[["Time_s", "TrackTemp", "AirTemp", "Humidity", "Pressure", "WindSpeed", "Rainfall"]]
-                      .rename(columns={"Time_s": key}),
-                    on=key,
+                    w[["Time_s"] + weather_cols].rename(columns={"Time_s": merge_key}),
+                    on=merge_key,
                     direction="nearest",
                 )
 
-        # Track status merge (nearest)
+        # Merge in track status (green flag, yellow flag, safety car, etc.)
         track_status = getattr(session, "track_status", None)
         if track_status is not None and len(track_status) > 0 and "Time" in track_status.columns:
-            ts = track_status.copy().sort_values("Time")
-            ts["Time_s"] = ts["Time"].apply(_safe_timedelta_to_seconds)
-            key = "LapStartTime_s" if "LapStartTime_s" in laps_df.columns else "Time_s"
-            if key in laps_df.columns:
-                laps_df = laps_df.sort_values(key)
+            ts = track_status.copy()
+            ts["Time_s"] = ts["Time"].apply(
+                lambda x: x.total_seconds() if pd.notna(x) else np.nan
+            )
+            ts = ts.sort_values("Time_s")
+
+            merge_key = "LapStartTime_s" if "LapStartTime_s" in laps_df.columns else "Time_s"
+            if merge_key in laps_df.columns:
+                laps_df = laps_df.sort_values(merge_key)
                 laps_df = pd.merge_asof(
                     laps_df,
-                    ts[["Time_s", "Status"]].rename(columns={"Time_s": key, "Status": "track_status"}),
-                    on=key,
+                    ts[["Time_s", "Status"]].rename(columns={"Time_s": merge_key, "Status": "track_status"}),
+                    on=merge_key,
                     direction="nearest",
                 )
 
-        rows.append(laps_df)
+        all_laps.append(laps_df)
+        print(f"  Loaded {len(laps_df)} laps")
 
-        print(f"[OK] Loaded {cfg.year} round {round_no:02d} {event_name}: {len(laps_df)} laps")
+    if not all_laps:
+        raise RuntimeError(
+            "No session data could be loaded. Check your internet connection and try again."
+        )
 
-    if not rows:
-        raise RuntimeError("No sessions were successfully loaded. Check year/session and your network/cache.")
+    # Combine all races into one big dataframe
+    raw = pd.concat(all_laps, ignore_index=True)
 
-    raw = pd.concat(rows, ignore_index=True)
+    # Remove laps that were flagged as inaccurate or deleted
+    if "IsAccurate" in raw.columns:
+        raw = raw[raw["IsAccurate"] != False].copy()
+    if "Deleted" in raw.columns:
+        raw = raw[raw["Deleted"] != True].copy()
 
-    # Light cleaning
-    raw = raw[raw.get("IsAccurate", True) != False].copy() if "IsAccurate" in raw.columns else raw
-    raw = raw[raw.get("Deleted", False) != True].copy() if "Deleted" in raw.columns else raw
+    # Make sure these columns are numeric (sometimes they come in as objects)
+    for col in ["LapNumber", "Stint", "TyreLife", "Position", "TrackTemp"]:
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
-    # Ensure numeric types
-    for c in ["LapNumber", "Stint", "TyreLife", "Position", "TrackTemp"]:
-        if c in raw.columns:
-            raw[c] = pd.to_numeric(raw[c], errors="coerce")
-
+    print(f"\nTotal laps loaded: {len(raw)}")
     return raw
 
 
-def save_raw(raw: pd.DataFrame, year: int) -> str:
-    ensure_dir(PATHS.data_dir)
-    out = PATHS.data_dir / f"raw_laps_{year}.parquet"
-    raw.to_parquet(out, index=False)
-    return str(out)
+def save_raw_laps(df, year):
+    """Save the raw lap data to a parquet file"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = DATA_DIR / f"raw_laps_{year}.parquet"
+    df.to_parquet(path, index=False)
+    print(f"Saved raw laps to: {path}")
+    return path
