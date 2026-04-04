@@ -1,4 +1,8 @@
 # F1 Race Strategy Predictor
+![Python](https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white)
+![XGBoost](https://img.shields.io/badge/XGBoost-EA4335?style=flat)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat&logo=streamlit&logoColor=white)
+![FastF1](https://img.shields.io/badge/FastF1-E10600?style=flat)
 
 A machine learning project that predicts **lap times** and **pit stop windows** for Formula 1 races, built using the [FastF1](https://docs.fastf1.dev/) Python library and scikit-learn / XGBoost.
 
